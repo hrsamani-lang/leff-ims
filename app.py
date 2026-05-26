@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime
 import os
 import json
+import io
 
 # -----------------------------
 # PAGE CONFIG
@@ -110,10 +111,13 @@ def init_tasks():
             with open("tasks.json", "r") as f:
                 data = json.load(f)
             if data:
-                return pd.DataFrame(data)
+                df = pd.DataFrame(data)
+                if "history" not in df.columns:
+                    df["history"] = pd.Series([[] for _ in range(len(df))])
+                return df
         except:
             pass
-    return pd.DataFrame(columns=["task_id", "doc_no", "description", "assigned_to_user", "assigned_by_user", "due_date", "status"])
+    return pd.DataFrame(columns=["task_id", "doc_no", "description", "assigned_to_user", "assigned_by_user", "due_date", "status", "history"])
 
 if "mdr" not in st.session_state:
     st.session_state.mdr = init_mdr()
@@ -139,8 +143,11 @@ def save_data():
         docs_save["Comments"] = docs_save["Comments"].apply(lambda x: x if isinstance(x, list) else [])
     with open("documents.json", "w") as f:
         json.dump(docs_save.to_dict(orient="records"), f, indent=2)
+    tasks_save = st.session_state.tasks.copy()
+    if "history" in tasks_save.columns:
+        tasks_save["history"] = tasks_save["history"].apply(lambda x: x if isinstance(x, list) else [])
     with open("tasks.json", "w") as f:
-        json.dump(st.session_state.tasks.to_dict(orient="records"), f, indent=2)
+        json.dump(tasks_save.to_dict(orient="records"), f, indent=2)
 
 def login():
     st.title("🔐 Login to LEFF IMS")
@@ -202,13 +209,14 @@ def show_sidebar():
     mdr_menu = ["Add MDR", "Import MDR from Excel", "MDR List"] if is_mdr_manager else []
     external_menu = ["External Intake"] if can_do_external_intake else []
     task_menu = ["Assign Task"] if can_assign_tasks else []
+    my_tasks_menu = ["Tasks I Created"] if can_assign_tasks else []
     user_mgmt_menu = ["User Management"] if is_admin else []
-    full_menu = ["Dashboard"] + upload_menu + external_menu + task_menu + user_mgmt_menu + mdr_menu + ["Document History", "Review Queue"]
+    full_menu = ["Dashboard"] + upload_menu + external_menu + task_menu + my_tasks_menu + user_mgmt_menu + mdr_menu + ["Document History", "Review Queue"]
     full_menu = list(dict.fromkeys(full_menu))
     return st.sidebar.radio("Navigation", full_menu)
 
 # -----------------------------
-# MAIN APP (Full Implementation)
+# MAIN APP
 # -----------------------------
 def main_app():
     menu = show_sidebar()
@@ -230,8 +238,21 @@ def main_app():
                 with col3:
                     if task["status"] == "Pending":
                         if st.button("✅ Mark Done", key=f"task_done_{idx}"):
+                            # Update history
+                            history_entry = {
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "changed_by": st.session_state.username,
+                                "old_status": "Pending",
+                                "new_status": "Completed"
+                            }
+                            current_history = st.session_state.tasks.at[idx, "history"]
+                            if not isinstance(current_history, list):
+                                current_history = []
+                            current_history.append(history_entry)
+                            st.session_state.tasks.at[idx, "history"] = current_history
                             st.session_state.tasks.at[idx, "status"] = "Completed"
                             save_data()
+                            st.success("Task marked as completed!")
                             st.rerun()
         st.markdown("---")
         if st.session_state.role == "Admin":
@@ -250,6 +271,9 @@ def main_app():
 
     # ---------- USER MANAGEMENT ----------
     elif menu == "User Management":
+        if st.session_state.role != "Admin":
+            st.error("⛔ Only Admin can access this page.")
+            return
         st.title("👥 User Management")
         st.warning("Only Admin can access this page. Changes are saved immediately.")
         st.subheader("Existing Users")
@@ -310,6 +334,63 @@ def main_app():
                     save_users(st.session_state.users_db)
                     st.success(f"User {del_user} deleted.")
                     st.rerun()
+
+    # ---------- TASKS I CREATED ----------
+    elif menu == "Tasks I Created":
+        if st.session_state.role not in ["Admin", "DCC", "Lead"]:
+            st.error("⛔ You are not authorized to view this page.")
+            return
+        st.title("📋 Tasks I Created")
+        my_created_tasks = st.session_state.tasks[st.session_state.tasks["assigned_by_user"] == st.session_state.username]
+        if len(my_created_tasks) == 0:
+            st.info("You haven't created any tasks yet.")
+        else:
+            # Create a display dataframe without history (for export)
+            display_df = my_created_tasks.copy()
+            display_df = display_df.drop(columns=["history"], errors="ignore")
+            # Add assignee full name
+            display_df["assigned_to_name"] = display_df["assigned_to_user"].apply(
+                lambda x: st.session_state.users_db.get(x, {}).get("full_name", x)
+            )
+            display_df = display_df.rename(columns={
+                "task_id": "Task ID",
+                "doc_no": "Document No",
+                "description": "Description",
+                "assigned_to_name": "Assigned To",
+                "due_date": "Due Date",
+                "status": "Status"
+            })
+            st.dataframe(display_df[["Task ID", "Document No", "Description", "Assigned To", "Due Date", "Status"]], use_container_width=True)
+            
+            # Export to Excel button
+            def to_excel(df):
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='MyCreatedTasks')
+                return output.getvalue()
+            
+            excel_data = to_excel(display_df[["Task ID", "Document No", "Description", "Assigned To", "Due Date", "Status"]])
+            st.download_button(
+                label="📥 Download Tasks as Excel",
+                data=excel_data,
+                file_name=f"my_tasks_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            st.markdown("---")
+            st.subheader("Task History (Status Changes)")
+            for idx, row in my_created_tasks.iterrows():
+                with st.expander(f"Task ID {row['task_id']}: {row['description'][:50]}..."):
+                    st.write(f"**Assigned to:** {row['assigned_to_user']} ({st.session_state.users_db.get(row['assigned_to_user'], {}).get('full_name', 'Unknown')})")
+                    st.write(f"**Due Date:** {row['due_date']}")
+                    st.write(f"**Current Status:** {row['status']}")
+                    history = row.get("history", [])
+                    if history and len(history) > 0:
+                        st.write("**History:**")
+                        for h in history:
+                            st.caption(f"🕒 {h['timestamp']} - {h['changed_by']} : {h['old_status']} → {h['new_status']}")
+                    else:
+                        st.caption("No status changes recorded yet.")
 
     # ---------- ADD MDR ----------
     elif menu == "Add MDR":
@@ -539,7 +620,8 @@ def main_app():
                         "assigned_to_user": assigned_to_username,
                         "assigned_by_user": st.session_state.username,
                         "due_date": due_date.strftime("%Y-%m-%d"),
-                        "status": "Pending"
+                        "status": "Pending",
+                        "history": []
                     }])
                     st.session_state.tasks = pd.concat([st.session_state.tasks, new_task], ignore_index=True)
                     save_data()
