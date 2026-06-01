@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import json
 import io
+import re
 
 # -----------------------------
 # PAGE CONFIG
@@ -47,23 +48,47 @@ if "users_db" not in st.session_state:
     st.session_state.users_db = load_users()
 
 # -----------------------------
-# FILE STORAGE
+# FILE STORAGE (ORGANIZED)
 # -----------------------------
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-def save_file_locally(file_bytes, file_name, doc_no, revision):
-    doc_folder = os.path.join(UPLOAD_DIR, str(doc_no))
-    os.makedirs(doc_folder, exist_ok=True)
-    file_path = os.path.join(doc_folder, f"Rev{revision}_{file_name}")
+def save_file_locally(file_bytes, file_name, doc_no, revision, upload_type="Internal", source=None, user_provided_name=None):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if upload_type == "Internal":
+        folder = os.path.join(UPLOAD_DIR, "Internal", f"{doc_no}_{today}")
+    else:
+        source_folder = source if source else "Unknown"
+        folder = os.path.join(UPLOAD_DIR, "External", source_folder, f"{doc_no}_{today}")
+    os.makedirs(folder, exist_ok=True)
+    
+    if upload_type == "External" and user_provided_name:
+        base_name = re.sub(r'[\\/*?:"<>|]', "", user_provided_name.strip())
+        if not base_name:
+            base_name = "document"
+        final_file_name = f"{base_name}_Rev{revision}_{file_name}"
+    else:
+        final_file_name = f"Rev{revision}_{file_name}"
+    
+    file_path = os.path.join(folder, final_file_name)
     with open(file_path, "wb") as f:
         f.write(file_bytes)
     return file_path
 
-def get_file_link(file_path):
+def download_button_from_path(file_path, button_text="📥 Download File"):
     if os.path.exists(file_path):
-        return os.path.abspath(file_path)
-    return "File not found"
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        file_name = os.path.basename(file_path)
+        st.download_button(
+            label=button_text,
+            data=file_bytes,
+            file_name=file_name,
+            mime="application/octet-stream",
+            key=f"download_{hash(file_path)}_{datetime.now().timestamp()}"
+        )
+    else:
+        st.warning("File not found.")
 
 # -----------------------------
 # INIT DATA
@@ -174,8 +199,8 @@ def logout():
             del st.session_state[key]
     st.rerun()
 
-def add_comment(doc_index, comment_text):
-    if not comment_text.strip():
+def add_comment(doc_index, comment_text, attachment_path=None):
+    if not comment_text.strip() and not attachment_path:
         return
     current_comments = st.session_state.documents.at[doc_index, "Comments"]
     if not isinstance(current_comments, list):
@@ -184,7 +209,8 @@ def add_comment(doc_index, comment_text):
         "user": st.session_state.full_name,
         "role": st.session_state.role,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "comment": comment_text
+        "comment": comment_text,
+        "attachment_path": attachment_path
     }
     current_comments.append(new_comment)
     st.session_state.documents.at[doc_index, "Comments"] = current_comments
@@ -238,7 +264,6 @@ def main_app():
                 with col3:
                     if task["status"] == "Pending":
                         if st.button("✅ Mark Done", key=f"task_done_{idx}"):
-                            # Update history
                             history_entry = {
                                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "changed_by": st.session_state.username,
@@ -345,10 +370,8 @@ def main_app():
         if len(my_created_tasks) == 0:
             st.info("You haven't created any tasks yet.")
         else:
-            # Create a display dataframe without history (for export)
             display_df = my_created_tasks.copy()
             display_df = display_df.drop(columns=["history"], errors="ignore")
-            # Add assignee full name
             display_df["assigned_to_name"] = display_df["assigned_to_user"].apply(
                 lambda x: st.session_state.users_db.get(x, {}).get("full_name", x)
             )
@@ -362,7 +385,6 @@ def main_app():
             })
             st.dataframe(display_df[["Task ID", "Document No", "Description", "Assigned To", "Due Date", "Status"]], use_container_width=True)
             
-            # Export to Excel button
             def to_excel(df):
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -515,7 +537,13 @@ def main_app():
                         st.error("Please select a file")
                     else:
                         try:
-                            file_path = save_file_locally(uploaded_file.getvalue(), uploaded_file.name, selected_doc, rev_no)
+                            file_path = save_file_locally(
+                                uploaded_file.getvalue(),
+                                uploaded_file.name,
+                                selected_doc,
+                                rev_no,
+                                upload_type="Internal"
+                            )
                         except Exception as e:
                             st.error(f"File save failed: {e}")
                             st.stop()
@@ -552,6 +580,7 @@ def main_app():
             title = st.text_input("Document Title")
             discipline = st.selectbox("Discipline", ["Structural", "Architectural", "Civil", "Mechanical", "Electrical"])
             code = st.text_input("Code (optional)")
+            custom_file_name = st.text_input("Custom file name (optional)", placeholder="e.g., Structural comments")
             uploaded_file = st.file_uploader("Attach File", type=["pdf", "docx", "xlsx", "zip", "jpg", "png"])
             submit = st.form_submit_button("Register Document")
             if submit:
@@ -565,7 +594,15 @@ def main_app():
                     if doc_no in st.session_state.mdr["Doc No"].values:
                         st.error("Document Number already exists.")
                     else:
-                        file_path = save_file_locally(uploaded_file.getvalue(), uploaded_file.name, doc_no, 1)
+                        file_path = save_file_locally(
+                            uploaded_file.getvalue(),
+                            uploaded_file.name,
+                            doc_no,
+                            1,
+                            upload_type="External",
+                            source=source,
+                            user_provided_name=custom_file_name if custom_file_name else None
+                        )
                         new_mdr_row = pd.DataFrame([{
                             "Doc No": doc_no,
                             "Title": title,
@@ -627,7 +664,7 @@ def main_app():
                     save_data()
                     st.success(f"Task assigned to {assigned_to_username}")
 
-    # ---------- REVIEW QUEUE ----------
+    # ---------- REVIEW QUEUE (FIXED INDEX) ----------
     elif menu == "Review Queue":
         st.title("Review Queue")
         active_docs = st.session_state.documents[
@@ -638,10 +675,12 @@ def main_app():
             role_queue = active_docs
         else:
             role_queue = active_docs[active_docs["Workflow Step"] == st.session_state.role]
+
         if len(role_queue) == 0:
             st.info(f"No documents waiting for your role: {st.session_state.role}")
         else:
-            for i, row in role_queue.iterrows():
+            for _, row in role_queue.iterrows():
+                original_idx = row.name
                 with st.expander(f"{row['Doc No']} | Rev {row['Revision']} | Step: {row['Workflow Step']}"):
                     st.write(f"**Uploaded By:** {row['Uploaded By']}")
                     st.write(f"**Date:** {row['Date']}")
@@ -649,23 +688,29 @@ def main_app():
                         st.info(f"**Source:** {row['Source']}")
                     if row.get("Email Reference"):
                         st.caption(f"**Email Ref:** {row['Email Reference']}")
+                    
                     if os.path.exists(row['File Path']):
-                        st.markdown(f"**File:** [Open file]({get_file_link(row['File Path'])})")
+                        download_button_from_path(row['File Path'], "📥 Download File")
+                    else:
+                        st.warning("File not found on disk.")
+                    
                     if row["Rejection Reason"]:
                         st.warning(f"**Previous Return Reason:** {row['Rejection Reason']}")
                     if row["Comments"] and len(row["Comments"]) > 0:
                         st.markdown("**Comments History:**")
                         for c in row["Comments"]:
                             st.caption(f"_{c['timestamp']} - {c['user']} ({c['role']}):_ {c['comment']}")
-                    with st.form(key=f"comment_form_{i}"):
-                        new_comment = st.text_area("Add a comment (no workflow change)", key=f"comment_{i}")
+                    
+                    with st.form(key=f"comment_form_{original_idx}"):
+                        new_comment = st.text_area("Add a comment (no workflow change)", key=f"comment_{original_idx}")
                         if st.form_submit_button("💬 Add Comment"):
                             if new_comment.strip():
-                                add_comment(i, new_comment)
+                                add_comment(original_idx, new_comment)
                                 st.success("Comment added")
                                 st.rerun()
+                    
                     if row["Status"] == "Rejected":
-                        if st.button("📤 Revise & Resubmit", key=f"resubmit_{i}"):
+                        if st.button("📤 Revise & Resubmit", key=f"resubmit_{original_idx}"):
                             if st.session_state.role not in ["Responsible", "Admin"]:
                                 st.error("Only Responsible or Admin can resubmit.")
                             else:
@@ -688,68 +733,69 @@ def main_app():
                                     "Email Reference": row.get("Email Reference", "")
                                 }])
                                 st.session_state.documents = pd.concat([st.session_state.documents, new_doc], ignore_index=True)
-                                st.session_state.documents.loc[i, "Status"] = "Archived"
+                                st.session_state.documents.loc[original_idx, "Status"] = "Archived"
                                 save_data()
                                 st.success("New revision created. Please upload corrected document.")
                                 st.rerun()
                         continue
+                    
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        if st.button("✅ Approve", key=f"approve_{i}"):
-                            comment_text = st.text_area("Comment (optional)", key=f"approve_comment_{i}")
+                        if st.button("✅ Approve", key=f"approve_{original_idx}"):
+                            comment_text = st.text_area("Comment (optional)", key=f"approve_comment_{original_idx}")
                             if comment_text:
-                                add_comment(i, f"Approved with comment: {comment_text}")
+                                add_comment(original_idx, f"Approved with comment: {comment_text}")
                             current_step = row["Workflow Step"]
                             step_index = WORKFLOW.index(current_step)
                             if step_index < len(WORKFLOW)-1:
                                 next_step = WORKFLOW[step_index+1]
-                                st.session_state.documents.loc[i, "Workflow Step"] = next_step
+                                st.session_state.documents.loc[original_idx, "Workflow Step"] = next_step
                                 mdr_idx = st.session_state.mdr[st.session_state.mdr["Doc No"] == row["Doc No"]].index[0]
                                 st.session_state.mdr.loc[mdr_idx, "Current Step"] = next_step
                                 if next_step == "Responsible" and step_index+1 == len(WORKFLOW)-1:
-                                    st.session_state.documents.loc[i, "Status"] = "Completed"
+                                    st.session_state.documents.loc[original_idx, "Status"] = "Completed"
                                     st.session_state.mdr.loc[mdr_idx, "Status"] = "Approved"
                                     st.success("Document fully approved!")
                                 else:
                                     st.success(f"Moved to {next_step}")
                             else:
-                                st.session_state.documents.loc[i, "Status"] = "Completed"
+                                st.session_state.documents.loc[original_idx, "Status"] = "Completed"
                                 mdr_idx = st.session_state.mdr[st.session_state.mdr["Doc No"] == row["Doc No"]].index[0]
                                 st.session_state.mdr.loc[mdr_idx, "Status"] = "Approved"
                                 st.success("Document approved.")
                             save_data()
                             st.rerun()
                     with col2:
-                        if st.button("❌ Reject (Return to previous step)", key=f"reject_{i}"):
-                            reason = st.text_area("Return reason (required)", key=f"reason_{i}")
-                            comment_text = st.text_area("Additional comment", key=f"reject_comment_{i}")
+                        if st.button("❌ Reject (Return to previous step)", key=f"reject_{original_idx}"):
+                            reason = st.text_area("Return reason (required)", key=f"reason_{original_idx}")
+                            comment_text = st.text_area("Additional comment", key=f"reject_comment_{original_idx}")
                             if not reason:
                                 st.error("Please provide a reason.")
                             else:
                                 if comment_text:
-                                    add_comment(i, f"Returned with comment: {comment_text}")
+                                    add_comment(original_idx, f"Returned with comment: {comment_text}")
                                 current_step = row["Workflow Step"]
                                 step_index = WORKFLOW.index(current_step)
                                 if step_index > 0:
                                     prev_step = WORKFLOW[step_index-1]
-                                    st.session_state.documents.loc[i, "Workflow Step"] = prev_step
+                                    st.session_state.documents.loc[original_idx, "Workflow Step"] = prev_step
                                     mdr_idx = st.session_state.mdr[st.session_state.mdr["Doc No"] == row["Doc No"]].index[0]
                                     st.session_state.mdr.loc[mdr_idx, "Current Step"] = prev_step
-                                    st.session_state.documents.loc[i, "Status"] = "In Progress"
-                                    st.session_state.documents.loc[i, "Rejection Reason"] = reason
+                                    st.session_state.documents.loc[original_idx, "Status"] = "In Progress"
+                                    st.session_state.documents.loc[original_idx, "Rejection Reason"] = reason
                                     st.warning(f"Returned to {prev_step}.")
                                 else:
                                     st.warning("Already at first step.")
                                 save_data()
                                 st.rerun()
                     with col3:
-                        if st.button("↩️ Request Changes (Return with files)", key=f"request_changes_{i}"):
-                            st.session_state[f"show_return_form_{i}"] = True
-                        if st.session_state.get(f"show_return_form_{i}", False):
-                            with st.form(key=f"return_form_{i}"):
+                        if st.button("↩️ Request Changes (Return with files)", key=f"request_changes_{original_idx}"):
+                            st.session_state[f"show_return_form_{original_idx}"] = True
+                        if st.session_state.get(f"show_return_form_{original_idx}", False):
+                            with st.form(key=f"return_form_{original_idx}"):
                                 return_reason = st.text_area("Reason for changes (required)")
                                 comment_text = st.text_area("Detailed comment")
-                                return_file = st.file_uploader("Attach file", type=["pdf", "docx", "txt", "jpg", "png"], key=f"return_file_{i}")
+                                return_file = st.file_uploader("Attach file", type=["pdf", "docx", "txt", "jpg", "png"], key=f"return_file_{original_idx}")
                                 submit_return = st.form_submit_button("Submit Return Request")
                                 if submit_return:
                                     if not return_reason:
@@ -758,44 +804,56 @@ def main_app():
                                         full_comment = f"Requested changes: {return_reason}"
                                         if comment_text:
                                             full_comment += f"\nComment: {comment_text}"
-                                        add_comment(i, full_comment)
+                                        # ذخیره فایل پیوست اگر وجود داشت
+                                        attachment_path = None
                                         if return_file:
                                             comments_dir = os.path.join(UPLOAD_DIR, "comments", row["Doc No"], f"rev_{row['Revision']}")
                                             os.makedirs(comments_dir, exist_ok=True)
                                             file_path = os.path.join(comments_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{return_file.name}")
                                             with open(file_path, "wb") as f:
                                                 f.write(return_file.getbuffer())
-                                            add_comment(i, f"Attached file: {return_file.name}")
+                                            attachment_path = file_path
+                                            full_comment += f"\nAttached file: {return_file.name}"
+                                        add_comment(original_idx, full_comment, attachment_path=attachment_path)
                                         current_step = row["Workflow Step"]
                                         step_index = WORKFLOW.index(current_step)
                                         if step_index > 0:
                                             prev_step = WORKFLOW[step_index-1]
-                                            st.session_state.documents.loc[i, "Workflow Step"] = prev_step
+                                            st.session_state.documents.loc[original_idx, "Workflow Step"] = prev_step
                                             mdr_idx = st.session_state.mdr[st.session_state.mdr["Doc No"] == row["Doc No"]].index[0]
                                             st.session_state.mdr.loc[mdr_idx, "Current Step"] = prev_step
-                                            st.session_state.documents.loc[i, "Status"] = "In Progress"
-                                            st.session_state.documents.loc[i, "Rejection Reason"] = return_reason
+                                            st.session_state.documents.loc[original_idx, "Status"] = "In Progress"
+                                            st.session_state.documents.loc[original_idx, "Rejection Reason"] = return_reason
                                             st.warning(f"Returned to {prev_step} for changes.")
                                         else:
                                             st.warning("Already at first step.")
                                         save_data()
-                                        st.session_state[f"show_return_form_{i}"] = False
+                                        st.session_state[f"show_return_form_{original_idx}"] = False
                                         st.rerun()
 
     # ---------- DOCUMENT HISTORY ----------
+       # ---------- DOCUMENT HISTORY ----------
     elif menu == "Document History":
         st.title("Document History")
         if len(st.session_state.mdr) == 0:
             st.warning("No MDR items available.")
         else:
+            # ایجاد یک دیکشنری برای نگاشت شماره مدرک به عنوان
+            doc_title_map = dict(zip(st.session_state.mdr["Doc No"], st.session_state.mdr["Title"]))
             doc_list = st.session_state.mdr["Doc No"].unique()
             selected_doc = st.selectbox("Select Document", doc_list)
+            selected_title = doc_title_map.get(selected_doc, "")
+            
+            # نمایش عنوان در کنار شماره مدرک
+            st.markdown(f"**Document:** {selected_doc} - {selected_title}")
+            
             doc_history = st.session_state.documents[st.session_state.documents["Doc No"] == selected_doc].sort_values("Revision")
             if len(doc_history) == 0:
                 st.info("No uploads for this document.")
             else:
                 for _, rev_row in doc_history.iterrows():
-                    with st.expander(f"Revision {rev_row['Revision']} - {rev_row['Date']} - Status: {rev_row['Status']}"):
+                    # عنوان را در expander نیز اضافه می‌کنیم
+                    with st.expander(f"Revision {rev_row['Revision']} - {rev_row['Date']} - Status: {rev_row['Status']} (Doc: {selected_doc} - {selected_title})"):
                         st.write(f"**Uploaded By:** {rev_row['Uploaded By']}")
                         st.write(f"**Workflow Step:** {rev_row['Workflow Step']}")
                         if rev_row.get("Source"):
@@ -805,12 +863,27 @@ def main_app():
                         if rev_row["Rejection Reason"]:
                             st.error(f"**Return Reason:** {rev_row['Rejection Reason']}")
                         if rev_row["File Path"] and os.path.exists(rev_row["File Path"]):
-                            st.markdown(f"**File:** [Open file]({get_file_link(rev_row['File Path'])})")
+                            download_button_from_path(rev_row["File Path"], "📥 Download File")
+                        else:
+                            st.warning("File not found.")
                         if rev_row["Comments"] and len(rev_row["Comments"]) > 0:
                             st.markdown("**Comments:**")
                             for c in rev_row["Comments"]:
-                                st.caption(f"_{c['timestamp']} - {c['user']} ({c['role']}):_ {c['comment']}")
-
+                                col1, col2 = st.columns([4, 1])
+                                with col1:
+                                    st.caption(f"_{c['timestamp']} - {c['user']} ({c['role']}):_ {c['comment']}")
+                                with col2:
+                                    if c.get("attachment_path") and os.path.exists(c["attachment_path"]):
+                                        with open(c["attachment_path"], "rb") as f:
+                                            file_bytes = f.read()
+                                        file_name = os.path.basename(c["attachment_path"])
+                                        st.download_button(
+                                            label="📎 Download",
+                                            data=file_bytes,
+                                            file_name=file_name,
+                                            mime="application/octet-stream",
+                                            key=f"download_comment_{hash(c['attachment_path'])}_{datetime.now().timestamp()}"
+                                        )
 # -----------------------------
 # RUN
 # -----------------------------
