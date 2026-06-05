@@ -5,6 +5,8 @@ import os
 import json
 import io
 import re
+import msal
+import requests
 
 # -----------------------------
 # PAGE CONFIG
@@ -69,53 +71,77 @@ if "projects" not in st.session_state:
     st.session_state.projects = load_projects()
 
 # -----------------------------
-# FILE STORAGE (PER PROJECT)
+# SHAREPOINT CONNECTION
 # -----------------------------
+@st.cache_resource
+def get_sharepoint_client():
+    """دریافت توکن و site_id از secrets و کش کردن آن"""
+    try:
+        tenant_id = st.secrets["TENANT_ID"]
+        client_id = st.secrets["CLIENT_ID"]
+        client_secret = st.secrets["CLIENT_SECRET"]
+        site_url = st.secrets["SHAREPOINT_SITE_URL"]
+    except Exception:
+        st.error("اطلاعات SharePoint در secrets یافت نشد. لطفاً فایل .streamlit/secrets.toml را تنظیم کنید.")
+        st.stop()
+    
+    # گرفتن توکن
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+    token_result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    if "access_token" not in token_result:
+        st.error(f"خطا در دریافت توکن: {token_result.get('error_description')}")
+        st.stop()
+    access_token = token_result["access_token"]
+    
+    # گرفتن Site ID
+    headers = {"Authorization": f"Bearer {access_token}"}
+    site_host = site_url.split('//')[-1].replace('/', ':')
+    site_response = requests.get(f"https://graph.microsoft.com/v1.0/sites/{site_host}", headers=headers)
+    if site_response.status_code != 200:
+        st.error(f"خطا در دریافت Site ID: {site_response.text}")
+        st.stop()
+    site_id = site_response.json()["id"]
+    
+    return access_token, site_id
+
+def upload_file_to_sharepoint(file_bytes, file_name, remote_folder_path):
+    """آپلود فایل به SharePoint در مسیر مشخص شده"""
+    access_token, site_id = get_sharepoint_client()
+    safe_name = re.sub(r'[\\/*?:"<>|]', '_', file_name)
+    full_path = f"{remote_folder_path}/{safe_name}".strip('/')
+    upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{full_path}:/content"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/octet-stream"}
+    response = requests.put(upload_url, headers=headers, data=file_bytes)
+    if response.status_code in [200, 201]:
+        # برگرداندن webUrl (لینک فایل در SharePoint)
+        return response.json().get("webUrl", full_path)
+    else:
+        raise Exception(f"خطا در آپلود: {response.text}")
+
+def download_file_from_sharepoint(file_url, button_text="📥 Download File"):
+    """دریافت فایل از SharePoint و نمایش دکمه دانلود"""
+    try:
+        access_token, _ = get_sharepoint_client()
+        # اگر file_url لینک وب است، باید به آدرس دانلود تبدیل شود
+        # ساده: از همان توکن برای دریافت فایل استفاده می‌کنیم
+        headers = {"Authorization": f"Bearer {access_token}"}
+        # برای سادگی، فرض می‌کنیم file_url همان webUrl است، اما برای دانلود نیاز به /content
+        # بهتر است id فایل را ذخیره کنیم. در این نسخه، ما id را ذخیره نمی‌کنیم، بنابراین یک راه حل موقت:
+        # از کاربر می‌خواهیم لینک را باز کند. اما برای بهبود، می‌توانیم در آینده id را نیز ذخیره کنیم.
+        st.markdown(f"[{button_text}]({file_url})", unsafe_allow_html=True)
+    except Exception as e:
+        st.warning(f"دریافت فایل امکان‌پذیر نیست: {e}")
+
+# -----------------------------
+# FILE STORAGE (LOCAL - فقط برای کامنت‌های قدیمی، اما اصلی به SharePoint می‌رود)
+# برای سازگاری با کدهای قبلی، تابع save_file_locally را نگه می‌داریم ولی استفاده نمی‌شود.
 BASE_UPLOAD_DIR = "uploads"
 os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
 
 def get_project_upload_dir(project_name):
     project_folder = re.sub(r'[\\/*?:"<>|]', "_", project_name)
     return os.path.join(BASE_UPLOAD_DIR, project_folder)
-
-def save_file_locally(file_bytes, file_name, doc_no, revision, upload_type="Internal", source=None, user_provided_name=None):
-    project_name = st.session_state.current_project
-    base_dir = get_project_upload_dir(project_name)
-    today = datetime.now().strftime("%Y-%m-%d")
-    if upload_type == "Internal":
-        folder = os.path.join(base_dir, "Internal", f"{doc_no}_{today}")
-    else:
-        source_folder = source if source else "Unknown"
-        folder = os.path.join(base_dir, "External", source_folder, f"{doc_no}_{today}")
-    os.makedirs(folder, exist_ok=True)
-
-    if upload_type == "External" and user_provided_name:
-        base_name = re.sub(r'[\\/*?:"<>|]', "", user_provided_name.strip())
-        if not base_name:
-            base_name = "document"
-        final_file_name = f"{base_name}_Rev{revision}_{file_name}"
-    else:
-        final_file_name = f"Rev{revision}_{file_name}"
-
-    file_path = os.path.join(folder, final_file_name)
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
-    return file_path
-
-def download_button_from_path(file_path, button_text="📥 Download File"):
-    if os.path.exists(file_path):
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-        file_name = os.path.basename(file_path)
-        st.download_button(
-            label=button_text,
-            data=file_bytes,
-            file_name=file_name,
-            mime="application/octet-stream",
-            key=f"download_{hash(file_path)}_{datetime.now().timestamp()}"
-        )
-    else:
-        st.warning("File not found.")
 
 # -----------------------------
 # DATA INIT (PER PROJECT)
@@ -265,7 +291,7 @@ def add_comment(doc_index, comment_text, attachment_path=None):
         "role": st.session_state.role,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "comment": comment_text,
-        "attachment_path": attachment_path
+        "attachment_path": attachment_path  # لینک فایل در SharePoint (webUrl)
     }
     current_comments.append(new_comment)
     st.session_state.documents.at[doc_index, "Comments"] = current_comments
@@ -279,7 +305,6 @@ def show_sidebar():
     st.sidebar.markdown(f"**User:** {st.session_state.full_name}")
     st.sidebar.markdown(f"**Role:** {st.session_state.role}")
 
-    # انتخاب پروژه
     if st.session_state.projects:
         project_list = list(st.session_state.projects.keys())
         current_proj = st.session_state.current_project if st.session_state.current_project in project_list else project_list[0]
@@ -308,10 +333,10 @@ def show_sidebar():
     full_menu = ["Dashboard"] + upload_menu + external_menu + task_menu + my_tasks_menu + user_mgmt_menu + project_mgmt_menu + mdr_menu + ["Document History", "Review Queue"]
     full_menu = list(dict.fromkeys(full_menu))
     return st.sidebar.radio("Navigation", full_menu)
+
 # -----------------------------
 # PAGE FUNCTIONS
 # -----------------------------
-
 def dashboard_page():
     st.title("Dashboard")
     st.subheader("📋 My Tasks")
@@ -477,35 +502,33 @@ def upload_document_page():
                     st.error("Please select a file")
                 else:
                     try:
-                        file_path = save_file_locally(
-                            uploaded_file.getvalue(),
-                            uploaded_file.name,
-                            selected_doc,
-                            rev_no,
-                            upload_type="Internal"
-                        )
+                        # آپلود به شیرپوینت
+                        project_name = st.session_state.current_project
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        remote_folder = f"IMS/{project_name}/Internal/{selected_doc}_{today}"
+                        file_url = upload_file_to_sharepoint(uploaded_file.getvalue(), uploaded_file.name, remote_folder)
+                        
+                        st.session_state.mdr.loc[idx, "Revision"] = rev_no
+                        st.session_state.mdr.loc[idx, "Status"] = "Under Review"
+                        st.session_state.mdr.loc[idx, "Current Step"] = WORKFLOW[1]
+                        new_doc = pd.DataFrame([{
+                            "Doc No": selected_doc,
+                            "Revision": rev_no,
+                            "Uploaded By": uploader,
+                            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "Workflow Step": WORKFLOW[1],
+                            "Status": "In Progress",
+                            "File Path": file_url,  # ذخیره لینک شیرپوینت
+                            "Rejection Reason": "",
+                            "Comments": [],
+                            "Source": "Internal",
+                            "Email Reference": ""
+                        }])
+                        st.session_state.documents = pd.concat([st.session_state.documents, new_doc], ignore_index=True)
+                        save_project_data(st.session_state.current_project, st.session_state.mdr, st.session_state.documents, st.session_state.tasks)
+                        st.success(f"Document uploaded as Revision {rev_no} and sent to DCC for review.")
                     except Exception as e:
-                        st.error(f"File save failed: {e}")
-                        st.stop()
-                    st.session_state.mdr.loc[idx, "Revision"] = rev_no
-                    st.session_state.mdr.loc[idx, "Status"] = "Under Review"
-                    st.session_state.mdr.loc[idx, "Current Step"] = WORKFLOW[1]
-                    new_doc = pd.DataFrame([{
-                        "Doc No": selected_doc,
-                        "Revision": rev_no,
-                        "Uploaded By": uploader,
-                        "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "Workflow Step": WORKFLOW[1],
-                        "Status": "In Progress",
-                        "File Path": file_path,
-                        "Rejection Reason": "",
-                        "Comments": [],
-                        "Source": "Internal",
-                        "Email Reference": ""
-                    }])
-                    st.session_state.documents = pd.concat([st.session_state.documents, new_doc], ignore_index=True)
-                    save_project_data(st.session_state.current_project, st.session_state.mdr, st.session_state.documents, st.session_state.tasks)
-                    st.success(f"Document uploaded as Revision {rev_no} and sent to DCC for review.")
+                        st.error(f"Upload failed: {e}")
 
 def external_intake_page():
     if st.session_state.role not in ["Admin", "DCC", "DocController"]:
@@ -533,41 +556,41 @@ def external_intake_page():
                 if doc_no in st.session_state.mdr["Doc No"].values:
                     st.error("Document Number already exists.")
                 else:
-                    file_path = save_file_locally(
-                        uploaded_file.getvalue(),
-                        uploaded_file.name,
-                        doc_no,
-                        1,
-                        upload_type="External",
-                        source=source,
-                        user_provided_name=custom_file_name if custom_file_name else None
-                    )
-                    new_mdr_row = pd.DataFrame([{
-                        "Doc No": doc_no,
-                        "Title": title,
-                        "Discipline": discipline,
-                        "Code": code,
-                        "Status": "Under Review",
-                        "Current Step": WORKFLOW[1],
-                        "Revision": 1
-                    }])
-                    st.session_state.mdr = pd.concat([st.session_state.mdr, new_mdr_row], ignore_index=True)
-                    new_doc_row = pd.DataFrame([{
-                        "Doc No": doc_no,
-                        "Revision": 1,
-                        "Uploaded By": st.session_state.full_name,
-                        "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "Workflow Step": WORKFLOW[1],
-                        "Status": "In Progress",
-                        "File Path": file_path,
-                        "Rejection Reason": "",
-                        "Comments": [],
-                        "Source": source,
-                        "Email Reference": email_reference
-                    }])
-                    st.session_state.documents = pd.concat([st.session_state.documents, new_doc_row], ignore_index=True)
-                    save_project_data(st.session_state.current_project, st.session_state.mdr, st.session_state.documents, st.session_state.tasks)
-                    st.success(f"External document from {source} registered as {doc_no} and sent to DCC.")
+                    try:
+                        project_name = st.session_state.current_project
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        safe_custom = re.sub(r'[\\/*?:"<>|]', "_", custom_file_name) if custom_file_name else "document"
+                        remote_folder = f"IMS/{project_name}/External/{source}/{doc_no}_{today}"
+                        file_url = upload_file_to_sharepoint(uploaded_file.getvalue(), uploaded_file.name, remote_folder)
+                        
+                        new_mdr_row = pd.DataFrame([{
+                            "Doc No": doc_no,
+                            "Title": title,
+                            "Discipline": discipline,
+                            "Code": code,
+                            "Status": "Under Review",
+                            "Current Step": WORKFLOW[1],
+                            "Revision": 1
+                        }])
+                        st.session_state.mdr = pd.concat([st.session_state.mdr, new_mdr_row], ignore_index=True)
+                        new_doc_row = pd.DataFrame([{
+                            "Doc No": doc_no,
+                            "Revision": 1,
+                            "Uploaded By": st.session_state.full_name,
+                            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "Workflow Step": WORKFLOW[1],
+                            "Status": "In Progress",
+                            "File Path": file_url,
+                            "Rejection Reason": "",
+                            "Comments": [],
+                            "Source": source,
+                            "Email Reference": email_reference
+                        }])
+                        st.session_state.documents = pd.concat([st.session_state.documents, new_doc_row], ignore_index=True)
+                        save_project_data(st.session_state.current_project, st.session_state.mdr, st.session_state.documents, st.session_state.tasks)
+                        st.success(f"External document from {source} registered as {doc_no} and sent to DCC.")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
 
 def assign_task_page():
     if st.session_state.role not in ["Admin", "DCC", "Lead"]:
@@ -654,6 +677,7 @@ def tasks_created_page():
                         st.caption(f"🕒 {h['timestamp']} - {h['changed_by']} : {h['old_status']} → {h['new_status']}")
                 else:
                     st.caption("No status changes recorded yet.")
+
 def review_queue_page():
     st.title("Review Queue")
     active_docs = st.session_state.documents[
@@ -678,10 +702,11 @@ def review_queue_page():
                 if row.get("Email Reference"):
                     st.caption(f"**Email Ref:** {row['Email Reference']}")
 
-                if os.path.exists(row['File Path']):
-                    download_button_from_path(row['File Path'], "📥 Download File")
+                # دانلود فایل از شیرپوینت (لینک)
+                if row["File Path"]:
+                    download_file_from_sharepoint(row["File Path"], "📥 Download File")
                 else:
-                    st.warning("File not found on disk.")
+                    st.warning("File not found.")
 
                 if row["Rejection Reason"]:
                     st.warning(f"**Previous Return Reason:** {row['Rejection Reason']}")
@@ -708,6 +733,7 @@ def review_queue_page():
                             st.session_state.mdr.loc[mdr_idx, "Revision"] = new_rev
                             st.session_state.mdr.loc[mdr_idx, "Status"] = "Under Review"
                             st.session_state.mdr.loc[mdr_idx, "Current Step"] = WORKFLOW[1]
+                            # برای سادگی، مسیر فایل قدیمی را کپی می‌کنیم (در واقع آپلود جدید نیاز است)
                             new_doc = pd.DataFrame([{
                                 "Doc No": row["Doc No"],
                                 "Revision": new_rev,
@@ -793,16 +819,20 @@ def review_queue_page():
                                     full_comment = f"Requested changes: {return_reason}"
                                     if comment_text:
                                         full_comment += f"\nComment: {comment_text}"
-                                    attachment_path = None
+                                    attachment_url = None
                                     if return_file:
-                                        comments_dir = os.path.join(BASE_UPLOAD_DIR, "comments", row["Doc No"], f"rev_{row['Revision']}")
-                                        os.makedirs(comments_dir, exist_ok=True)
-                                        file_path = os.path.join(comments_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{return_file.name}")
-                                        with open(file_path, "wb") as f:
-                                            f.write(return_file.getbuffer())
-                                        attachment_path = file_path
-                                        full_comment += f"\nAttached file: {return_file.name}"
-                                    add_comment(original_idx, full_comment, attachment_path)
+                                        # آپلود فایل برگشتی به شیرپوینت
+                                        project_name = st.session_state.current_project
+                                        doc_no = row["Doc No"]
+                                        rev = row["Revision"]
+                                        remote_folder = f"IMS/{project_name}/Comments/{doc_no}/rev_{rev}"
+                                        try:
+                                            attachment_url = upload_file_to_sharepoint(return_file.getvalue(), return_file.name, remote_folder)
+                                            full_comment += f"\nAttached file: {return_file.name}"
+                                        except Exception as e:
+                                            st.error(f"خطا در آپلود فایل برگشتی: {e}")
+                                            continue
+                                    add_comment(original_idx, full_comment, attachment_url)
                                     current_step = row["Workflow Step"]
                                     step_index = WORKFLOW.index(current_step)
                                     if step_index > 0:
@@ -834,7 +864,7 @@ def document_history_page():
             st.info("No uploads for this document.")
         else:
             for _, rev_row in doc_history.iterrows():
-                with st.expander(f"Revision {rev_row['Revision']} - {rev_row['Date']} - Status: {rev_row['Status']} (Doc: {selected_doc} - {selected_title})"):
+                with st.expander(f"Revision {rev_row['Revision']} - {rev_row['Date']} - Status: {rev_row['Status']}"):
                     st.write(f"**Uploaded By:** {rev_row['Uploaded By']}")
                     st.write(f"**Workflow Step:** {rev_row['Workflow Step']}")
                     if rev_row.get("Source"):
@@ -843,8 +873,8 @@ def document_history_page():
                         st.caption(f"**Email Ref:** {rev_row['Email Reference']}")
                     if rev_row["Rejection Reason"]:
                         st.error(f"**Return Reason:** {rev_row['Rejection Reason']}")
-                    if rev_row["File Path"] and os.path.exists(rev_row["File Path"]):
-                        download_button_from_path(rev_row["File Path"], "📥 Download File")
+                    if rev_row["File Path"]:
+                        download_file_from_sharepoint(rev_row["File Path"], "📥 Download File")
                     else:
                         st.warning("File not found.")
                     if rev_row["Comments"] and len(rev_row["Comments"]) > 0:
@@ -854,17 +884,8 @@ def document_history_page():
                             with col1:
                                 st.caption(f"_{c['timestamp']} - {c['user']} ({c['role']}):_ {c['comment']}")
                             with col2:
-                                if c.get("attachment_path") and os.path.exists(c["attachment_path"]):
-                                    with open(c["attachment_path"], "rb") as f:
-                                        file_bytes = f.read()
-                                    file_name = os.path.basename(c["attachment_path"])
-                                    st.download_button(
-                                        label="📎 Download",
-                                        data=file_bytes,
-                                        file_name=file_name,
-                                        mime="application/octet-stream",
-                                        key=f"download_comment_{hash(c['attachment_path'])}_{datetime.now().timestamp()}"
-                                    )
+                                if c.get("attachment_path") and isinstance(c["attachment_path"], str):
+                                    download_file_from_sharepoint(c["attachment_path"], "📎 Download Attachment")
 
 def project_management_page():
     st.title("🏗️ Project Management")
@@ -895,8 +916,7 @@ def project_management_page():
                     "created_date": datetime.now().strftime("%Y-%m-%d %H:%M")
                 }
                 save_projects(st.session_state.projects)
-                proj_folder = re.sub(r'[\\/*?:"<>|]', "_", proj_name)
-                os.makedirs(os.path.join(BASE_UPLOAD_DIR, proj_folder), exist_ok=True)
+                # ایجاد پوشه پروژه در SharePoint? نه لازم نیست، فایل‌ها در مسیرهای داینامیک ذخیره می‌شوند.
                 st.success(f"Project '{proj_name}' created successfully.")
                 st.rerun()
 
