@@ -71,11 +71,10 @@ if "projects" not in st.session_state:
     st.session_state.projects = load_projects()
 
 # -----------------------------
-# SHAREPOINT CONNECTION
+# SHAREPOINT CONNECTION (APP-ONLY)
 # -----------------------------
 @st.cache_resource
 def get_sharepoint_client():
-    """دریافت توکن و site_id از secrets و کش کردن آن"""
     try:
         tenant_id = st.secrets["TENANT_ID"]
         client_id = st.secrets["CLIENT_ID"]
@@ -84,8 +83,7 @@ def get_sharepoint_client():
     except Exception:
         st.error("اطلاعات SharePoint در secrets یافت نشد. لطفاً فایل .streamlit/secrets.toml را تنظیم کنید.")
         st.stop()
-    
-    # گرفتن توکن
+
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
     token_result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
@@ -93,8 +91,7 @@ def get_sharepoint_client():
         st.error(f"خطا در دریافت توکن: {token_result.get('error_description')}")
         st.stop()
     access_token = token_result["access_token"]
-    
-    # گرفتن Site ID
+
     headers = {"Authorization": f"Bearer {access_token}"}
     site_host = site_url.split('//')[-1].replace('/', ':')
     site_response = requests.get(f"https://graph.microsoft.com/v1.0/sites/{site_host}", headers=headers)
@@ -102,11 +99,10 @@ def get_sharepoint_client():
         st.error(f"خطا در دریافت Site ID: {site_response.text}")
         st.stop()
     site_id = site_response.json()["id"]
-    
+
     return access_token, site_id
 
 def upload_file_to_sharepoint(file_bytes, file_name, remote_folder_path):
-    """آپلود فایل به SharePoint در مسیر مشخص شده"""
     access_token, site_id = get_sharepoint_client()
     safe_name = re.sub(r'[\\/*?:"<>|]', '_', file_name)
     full_path = f"{remote_folder_path}/{safe_name}".strip('/')
@@ -114,34 +110,53 @@ def upload_file_to_sharepoint(file_bytes, file_name, remote_folder_path):
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/octet-stream"}
     response = requests.put(upload_url, headers=headers, data=file_bytes)
     if response.status_code in [200, 201]:
-        # برگرداندن webUrl (لینک فایل در SharePoint)
-        return response.json().get("webUrl", full_path)
+        result = response.json()
+        return {
+            "webUrl": result.get("webUrl"),
+            "id": result.get("id")
+        }
     else:
-        raise Exception(f"خطا در آپلود: {response.text}")
+        raise Exception(f"Upload failed: {response.text}")
 
-def download_file_from_sharepoint(file_url, button_text="📥 Download File"):
-    """دریافت فایل از SharePoint و نمایش دکمه دانلود"""
+def download_file_from_sharepoint(file_id_or_url, button_text="📥 Download File", file_name=None):
+    """دریافت فایل از SharePoint با استفاده از توکن برنامه (بدون لاگین کاربر)"""
     try:
-        access_token, _ = get_sharepoint_client()
-        # اگر file_url لینک وب است، باید به آدرس دانلود تبدیل شود
-        # ساده: از همان توکن برای دریافت فایل استفاده می‌کنیم
+        access_token, site_id = get_sharepoint_client()
         headers = {"Authorization": f"Bearer {access_token}"}
-        # برای سادگی، فرض می‌کنیم file_url همان webUrl است، اما برای دانلود نیاز به /content
-        # بهتر است id فایل را ذخیره کنیم. در این نسخه، ما id را ذخیره نمی‌کنیم، بنابراین یک راه حل موقت:
-        # از کاربر می‌خواهیم لینک را باز کند. اما برای بهبود، می‌توانیم در آینده id را نیز ذخیره کنیم.
-        st.markdown(f"[{button_text}]({file_url})", unsafe_allow_html=True)
+        
+        # تعیین آدرس API برای دانلود محتوا
+        if file_id_or_url.startswith("http"):
+            # اگر webUrl داریم، مستقیماً درخواست GET با توکن می‌زنیم
+            response = requests.get(file_id_or_url, headers=headers, allow_redirects=True)
+        else:
+            # اگر file_id داریم (توصیه می‌شود)
+            content_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/items/{file_id_or_url}/content"
+            response = requests.get(content_url, headers=headers)
+        
+        if response.status_code == 200:
+            if not file_name:
+                # استخراج نام فایل از هدر Content-Disposition یا URL
+                content_disposition = response.headers.get('Content-Disposition')
+                if content_disposition and 'filename=' in content_disposition:
+                    file_name = content_disposition.split('filename=')[1].strip('"')
+                else:
+                    file_name = "downloaded_file"
+            st.download_button(
+                label=button_text,
+                data=response.content,
+                file_name=file_name,
+                mime="application/octet-stream",
+                key=f"download_{hash(file_id_or_url)}_{datetime.now().timestamp()}"
+            )
+        else:
+            st.error(f"خطا در دانلود فایل: {response.status_code}")
     except Exception as e:
-        st.warning(f"دریافت فایل امکان‌پذیر نیست: {e}")
+        st.error(f"خطا: {e}")
 
 # -----------------------------
 # FILE STORAGE (LOCAL - فقط برای کامنت‌های قدیمی، اما اصلی به SharePoint می‌رود)
-# برای سازگاری با کدهای قبلی، تابع save_file_locally را نگه می‌داریم ولی استفاده نمی‌شود.
 BASE_UPLOAD_DIR = "uploads"
 os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
-
-def get_project_upload_dir(project_name):
-    project_folder = re.sub(r'[\\/*?:"<>|]', "_", project_name)
-    return os.path.join(BASE_UPLOAD_DIR, project_folder)
 
 # -----------------------------
 # DATA INIT (PER PROJECT)
@@ -184,7 +199,7 @@ def init_mdr(project_name):
     return df
 
 def init_documents(project_name):
-    default = pd.DataFrame(columns=["Doc No", "Revision", "Uploaded By", "Date", "Workflow Step", "Status", "File Path", "Rejection Reason", "Comments", "Source", "Email Reference"])
+    default = pd.DataFrame(columns=["Doc No", "Revision", "Uploaded By", "Date", "Workflow Step", "Status", "File Path", "File Id", "Rejection Reason", "Comments", "Source", "Email Reference"])
     if not project_name:
         return default
     file_name = get_documents_file(project_name)
@@ -193,6 +208,8 @@ def init_documents(project_name):
         df["Doc No"] = df["Doc No"].astype(str)
     if "Comments" not in df.columns:
         df["Comments"] = pd.Series([[] for _ in range(len(df))])
+    if "File Id" not in df.columns:
+        df["File Id"] = ""
     return df
 
 def init_tasks(project_name):
@@ -280,8 +297,8 @@ def logout():
             del st.session_state[key]
     st.rerun()
 
-def add_comment(doc_index, comment_text, attachment_path=None):
-    if not comment_text.strip() and not attachment_path:
+def add_comment(doc_index, comment_text, attachment_file_id=None, attachment_name=None):
+    if not comment_text.strip() and not attachment_file_id:
         return
     current_comments = st.session_state.documents.at[doc_index, "Comments"]
     if not isinstance(current_comments, list):
@@ -291,7 +308,8 @@ def add_comment(doc_index, comment_text, attachment_path=None):
         "role": st.session_state.role,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "comment": comment_text,
-        "attachment_path": attachment_path  # لینک فایل در SharePoint (webUrl)
+        "attachment_file_id": attachment_file_id,
+        "attachment_name": attachment_name
     }
     current_comments.append(new_comment)
     st.session_state.documents.at[doc_index, "Comments"] = current_comments
@@ -502,11 +520,10 @@ def upload_document_page():
                     st.error("Please select a file")
                 else:
                     try:
-                        # آپلود به شیرپوینت
                         project_name = st.session_state.current_project
                         today = datetime.now().strftime("%Y-%m-%d")
                         remote_folder = f"IMS/{project_name}/Internal/{selected_doc}_{today}"
-                        file_url = upload_file_to_sharepoint(uploaded_file.getvalue(), uploaded_file.name, remote_folder)
+                        upload_result = upload_file_to_sharepoint(uploaded_file.getvalue(), uploaded_file.name, remote_folder)
                         
                         st.session_state.mdr.loc[idx, "Revision"] = rev_no
                         st.session_state.mdr.loc[idx, "Status"] = "Under Review"
@@ -518,7 +535,8 @@ def upload_document_page():
                             "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "Workflow Step": WORKFLOW[1],
                             "Status": "In Progress",
-                            "File Path": file_url,  # ذخیره لینک شیرپوینت
+                            "File Path": upload_result["webUrl"],
+                            "File Id": upload_result["id"],
                             "Rejection Reason": "",
                             "Comments": [],
                             "Source": "Internal",
@@ -559,9 +577,8 @@ def external_intake_page():
                     try:
                         project_name = st.session_state.current_project
                         today = datetime.now().strftime("%Y-%m-%d")
-                        safe_custom = re.sub(r'[\\/*?:"<>|]', "_", custom_file_name) if custom_file_name else "document"
                         remote_folder = f"IMS/{project_name}/External/{source}/{doc_no}_{today}"
-                        file_url = upload_file_to_sharepoint(uploaded_file.getvalue(), uploaded_file.name, remote_folder)
+                        upload_result = upload_file_to_sharepoint(uploaded_file.getvalue(), uploaded_file.name, remote_folder)
                         
                         new_mdr_row = pd.DataFrame([{
                             "Doc No": doc_no,
@@ -580,7 +597,8 @@ def external_intake_page():
                             "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "Workflow Step": WORKFLOW[1],
                             "Status": "In Progress",
-                            "File Path": file_url,
+                            "File Path": upload_result["webUrl"],
+                            "File Id": upload_result["id"],
                             "Rejection Reason": "",
                             "Comments": [],
                             "Source": source,
@@ -702,9 +720,10 @@ def review_queue_page():
                 if row.get("Email Reference"):
                     st.caption(f"**Email Ref:** {row['Email Reference']}")
 
-                # دانلود فایل از شیرپوینت (لینک)
-                if row["File Path"]:
-                    download_file_from_sharepoint(row["File Path"], "📥 Download File")
+                if row.get("File Id"):
+                    download_file_from_sharepoint(row["File Id"], "📥 Download File", row.get("File Name"))
+                elif row.get("File Path"):
+                    download_file_from_sharepoint(row["File Path"], "📥 Download File", row.get("File Name"))
                 else:
                     st.warning("File not found.")
 
@@ -733,7 +752,6 @@ def review_queue_page():
                             st.session_state.mdr.loc[mdr_idx, "Revision"] = new_rev
                             st.session_state.mdr.loc[mdr_idx, "Status"] = "Under Review"
                             st.session_state.mdr.loc[mdr_idx, "Current Step"] = WORKFLOW[1]
-                            # برای سادگی، مسیر فایل قدیمی را کپی می‌کنیم (در واقع آپلود جدید نیاز است)
                             new_doc = pd.DataFrame([{
                                 "Doc No": row["Doc No"],
                                 "Revision": new_rev,
@@ -742,6 +760,7 @@ def review_queue_page():
                                 "Workflow Step": WORKFLOW[1],
                                 "Status": "In Progress",
                                 "File Path": row["File Path"],
+                                "File Id": row["File Id"],
                                 "Rejection Reason": "",
                                 "Comments": [],
                                 "Source": row.get("Source", "Internal"),
@@ -819,20 +838,22 @@ def review_queue_page():
                                     full_comment = f"Requested changes: {return_reason}"
                                     if comment_text:
                                         full_comment += f"\nComment: {comment_text}"
-                                    attachment_url = None
+                                    attachment_id = None
+                                    attachment_name = None
                                     if return_file:
-                                        # آپلود فایل برگشتی به شیرپوینت
-                                        project_name = st.session_state.current_project
-                                        doc_no = row["Doc No"]
-                                        rev = row["Revision"]
-                                        remote_folder = f"IMS/{project_name}/Comments/{doc_no}/rev_{rev}"
                                         try:
-                                            attachment_url = upload_file_to_sharepoint(return_file.getvalue(), return_file.name, remote_folder)
+                                            project_name = st.session_state.current_project
+                                            doc_no = row["Doc No"]
+                                            rev = row["Revision"]
+                                            remote_folder = f"IMS/{project_name}/Comments/{doc_no}/rev_{rev}"
+                                            upload_result = upload_file_to_sharepoint(return_file.getvalue(), return_file.name, remote_folder)
+                                            attachment_id = upload_result["id"]
+                                            attachment_name = return_file.name
                                             full_comment += f"\nAttached file: {return_file.name}"
                                         except Exception as e:
                                             st.error(f"خطا در آپلود فایل برگشتی: {e}")
                                             continue
-                                    add_comment(original_idx, full_comment, attachment_url)
+                                    add_comment(original_idx, full_comment, attachment_id, attachment_name)
                                     current_step = row["Workflow Step"]
                                     step_index = WORKFLOW.index(current_step)
                                     if step_index > 0:
@@ -873,7 +894,9 @@ def document_history_page():
                         st.caption(f"**Email Ref:** {rev_row['Email Reference']}")
                     if rev_row["Rejection Reason"]:
                         st.error(f"**Return Reason:** {rev_row['Rejection Reason']}")
-                    if rev_row["File Path"]:
+                    if rev_row.get("File Id"):
+                        download_file_from_sharepoint(rev_row["File Id"], "📥 Download File")
+                    elif rev_row.get("File Path"):
                         download_file_from_sharepoint(rev_row["File Path"], "📥 Download File")
                     else:
                         st.warning("File not found.")
@@ -884,7 +907,9 @@ def document_history_page():
                             with col1:
                                 st.caption(f"_{c['timestamp']} - {c['user']} ({c['role']}):_ {c['comment']}")
                             with col2:
-                                if c.get("attachment_path") and isinstance(c["attachment_path"], str):
+                                if c.get("attachment_file_id"):
+                                    download_file_from_sharepoint(c["attachment_file_id"], "📎 Download Attachment", c.get("attachment_name", "attachment"))
+                                elif c.get("attachment_path"):  # برای سازگاری با داده‌های قدیمی
                                     download_file_from_sharepoint(c["attachment_path"], "📎 Download Attachment")
 
 def project_management_page():
@@ -916,7 +941,6 @@ def project_management_page():
                     "created_date": datetime.now().strftime("%Y-%m-%d %H:%M")
                 }
                 save_projects(st.session_state.projects)
-                # ایجاد پوشه پروژه در SharePoint? نه لازم نیست، فایل‌ها در مسیرهای داینامیک ذخیره می‌شوند.
                 st.success(f"Project '{proj_name}' created successfully.")
                 st.rerun()
 
