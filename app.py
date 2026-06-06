@@ -71,7 +71,7 @@ if "projects" not in st.session_state:
     st.session_state.projects = load_projects()
 
 # -----------------------------
-# SHAREPOINT CONNECTION (APP-ONLY)
+# SHAREPOINT CONNECTION (APP-ONLY with Sites.Selected)
 # -----------------------------
 @st.cache_resource
 def get_sharepoint_client():
@@ -106,6 +106,7 @@ def upload_file_to_sharepoint(file_bytes, file_name, remote_folder_path):
     access_token, site_id = get_sharepoint_client()
     safe_name = re.sub(r'[\\/*?:"<>|]', '_', file_name)
     full_path = f"{remote_folder_path}/{safe_name}".strip('/')
+    # استفاده از مسیر مستقیم drive/root (با مجوز Sites.Selected کار می‌کند)
     upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{full_path}:/content"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/octet-stream"}
     response = requests.put(upload_url, headers=headers, data=file_bytes)
@@ -124,9 +125,8 @@ def download_file_from_sharepoint(file_id_or_url, button_text="📥 Download Fil
         access_token, site_id = get_sharepoint_client()
         headers = {"Authorization": f"Bearer {access_token}"}
         
-        # تعیین آدرس API برای دانلود محتوا
         if file_id_or_url.startswith("http"):
-            # اگر webUrl داریم، مستقیماً درخواست GET با توکن می‌زنیم
+            # اگر webUrl داریم، مستقیماً با توکن درخواست می‌زنیم
             response = requests.get(file_id_or_url, headers=headers, allow_redirects=True)
         else:
             # اگر file_id داریم (توصیه می‌شود)
@@ -135,7 +135,6 @@ def download_file_from_sharepoint(file_id_or_url, button_text="📥 Download Fil
         
         if response.status_code == 200:
             if not file_name:
-                # استخراج نام فایل از هدر Content-Disposition یا URL
                 content_disposition = response.headers.get('Content-Disposition')
                 if content_disposition and 'filename=' in content_disposition:
                     file_name = content_disposition.split('filename=')[1].strip('"')
