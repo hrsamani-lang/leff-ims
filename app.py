@@ -71,7 +71,7 @@ if "projects" not in st.session_state:
     st.session_state.projects = load_projects()
 
 # -----------------------------
-# SHAREPOINT CONNECTION (APP-ONLY with Sites.Selected)
+# SHAREPOINT CONNECTION (WITH PRE-FETCHED SITE_ID)
 # -----------------------------
 @st.cache_resource
 def get_sharepoint_client():
@@ -79,7 +79,7 @@ def get_sharepoint_client():
         tenant_id = st.secrets["TENANT_ID"]
         client_id = st.secrets["CLIENT_ID"]
         client_secret = st.secrets["CLIENT_SECRET"]
-        site_url = st.secrets["SHAREPOINT_SITE_URL"]
+        site_id = st.secrets["SITE_ID"]
     except Exception:
         st.error("اطلاعات SharePoint در secrets یافت نشد. لطفاً فایل .streamlit/secrets.toml را تنظیم کنید.")
         st.stop()
@@ -92,21 +92,14 @@ def get_sharepoint_client():
         st.stop()
     access_token = token_result["access_token"]
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-    site_host = site_url.split('//')[-1].replace('/', ':')
-    site_response = requests.get(f"https://graph.microsoft.com/v1.0/sites/{site_host}", headers=headers)
-    if site_response.status_code != 200:
-        st.error(f"خطا در دریافت Site ID: {site_response.text}")
-        st.stop()
-    site_id = site_response.json()["id"]
-
     return access_token, site_id
 
 def upload_file_to_sharepoint(file_bytes, file_name, remote_folder_path):
     access_token, site_id = get_sharepoint_client()
     safe_name = re.sub(r'[\\/*?:"<>|]', '_', file_name)
     full_path = f"{remote_folder_path}/{safe_name}".strip('/')
-    # استفاده از مسیر مستقیم drive/root (با مجوز Sites.Selected کار می‌کند)
+    
+    # استفاده از مسیر مستقیم با drive/root (با مجوز Sites.Selected کار می‌کند)
     upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root:/{full_path}:/content"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/octet-stream"}
     response = requests.put(upload_url, headers=headers, data=file_bytes)
@@ -126,10 +119,8 @@ def download_file_from_sharepoint(file_id_or_url, button_text="📥 Download Fil
         headers = {"Authorization": f"Bearer {access_token}"}
         
         if file_id_or_url.startswith("http"):
-            # اگر webUrl داریم، مستقیماً با توکن درخواست می‌زنیم
             response = requests.get(file_id_or_url, headers=headers, allow_redirects=True)
         else:
-            # اگر file_id داریم (توصیه می‌شود)
             content_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/items/{file_id_or_url}/content"
             response = requests.get(content_url, headers=headers)
         
@@ -153,7 +144,7 @@ def download_file_from_sharepoint(file_id_or_url, button_text="📥 Download Fil
         st.error(f"خطا: {e}")
 
 # -----------------------------
-# FILE STORAGE (LOCAL - فقط برای کامنت‌های قدیمی، اما اصلی به SharePoint می‌رود)
+# FILE STORAGE (LOCAL - فقط برای کامنت‌های قدیمی)
 BASE_UPLOAD_DIR = "uploads"
 os.makedirs(BASE_UPLOAD_DIR, exist_ok=True)
 
